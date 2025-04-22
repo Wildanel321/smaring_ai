@@ -12,6 +12,8 @@ from langchain.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
+from transformers import AutoTokenizer, pipeline
+import torch
 
 # Buat folder chats dan data kalau belum ada
 if not os.path.exists("chats"):
@@ -25,10 +27,23 @@ if not os.path.exists(users_file):
     with open(users_file, "w", encoding="utf-8") as f:
         json.dump({}, f)
 
-# Fungsi untuk load users
+# Fungsi untuk load users dengan error handling
 def load_users():
-    with open(users_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(users_file, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:  # Jika file kosong
+                return {}
+            f.seek(0)  # Kembali ke awal file setelah baca content
+            return json.load(f)
+    except FileNotFoundError:
+        with open(users_file, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        return {}
+    except json.JSONDecodeError:
+        with open(users_file, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        return {}
 
 # Fungsi untuk save users
 def save_users(users):
@@ -60,6 +75,26 @@ def login_user(username, password):
 def generate_verification_code():
     return ''.join(random.choices(string.digits, k=6))
 
+# Fungsi untuk load model
+def load_model(model_name):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        device = 0 if torch.cuda.is_available() else -1
+        pipe = pipeline(
+            "text-generation",
+            model=model_name,
+            tokenizer=tokenizer,
+            device=device,
+            max_length=512,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.2
+        )
+        return HuggingFacePipeline(pipeline=pipe)
+    except Exception as e:
+        st.error(f"Gagal load model {model_name}: {str(e)}")
+        return None
+
 # Inisialisasi session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -74,6 +109,8 @@ if "reset_code" not in st.session_state:
     st.session_state.reset_code = None
 if "reset_username" not in st.session_state:
     st.session_state.reset_username = None
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 # CSS untuk UI
 st.markdown("""
@@ -147,6 +184,18 @@ st.markdown("""
     .logout-button:hover {
         background-color: #c82333;
     }
+    .save-account-button {
+        background-color: #28a745;
+        color: white;
+        padding: 8px 15px;
+        border-radius: 5px;
+        border: none;
+        font-weight: bold;
+        cursor: pointer;
+    }
+    .save-account-button:hover {
+        background-color: #218838;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -214,6 +263,90 @@ if not st.session_state.user:
                 else:
                     st.error("Kode verifikasi salah!")
 else:
+    # Sidebar: User info, edit profil, logout, dropdown model, dan simpan akun
+    with st.sidebar:
+        st.write(f"**User**: {st.session_state.user['username']}")
+        st.write(f"**Role**: {st.session_state.user['role']}")
+        if st.session_state.user["role"] == "guru":
+            st.write("Kamu bisa tambah/update jadwal atau silabus!")
+        else:
+            st.write("Tanya apa aja, simpan chatmu!")
+        
+        # Dropdown untuk switch model
+        st.markdown("---")
+        st.header("Pilih Model AI")
+        model_options = {
+            "TinyLlama (Default)": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "Falcon 7B": "tiiuae/falcon-7b",
+            "DeepSeed Falcon 180B LoRA-FA": "philschmid/deepseed-falcon-180b-lora-fa"
+        }
+        selected_model_name = st.selectbox(
+            "Pilih model:", 
+            options=list(model_options.keys()),
+            index=list(model_options.keys()).index("TinyLlama (Default)") if st.session_state.selected_model == "TinyLlama/TinyLlama-1.1B-Chat-v1.0" else list(model_options.keys()).index("DeepSeed Falcon 180B LoRA-FA")
+        )
+
+        # Update model jika pilihan berubah
+        selected_model_id = model_options[selected_model_name]
+        if st.session_state.selected_model != selected_model_id:
+            st.session_state.selected_model = selected_model_id
+            st.session_state.llm = None  # Reset llm agar di-load ulang
+
+        # Fitur Simpan Akun (khusus guru)
+        st.markdown("---")
+        if st.session_state.user["role"] == "guru":
+            st.subheader("Simpan Akun")
+            users = load_users()
+            if users:
+                account_content = "\n".join(
+                    f"Username: {username}, Role: {data['role']}, Password (hashed): {data['password']}"
+                    for username, data in users.items()
+                )
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                filename = f"accounts_{timestamp}.txt"
+                st.download_button(
+                    label="Simpan Akun",
+                    data=account_content,
+                    file_name=filename,
+                    mime="text/plain",
+                    key="save_account",
+                    help="Download data akun sebagai file .txt",
+                    use_container_width=True,
+                    type="primary"
+                )
+            else:
+                st.write("Belum ada akun yang terdaftar.")
+
+        st.markdown("---")
+        st.subheader("Edit Profil")
+        edit_password = st.text_input("Password Baru (kosongkan jika tidak ubah)", type="password", key="edit_password")
+        edit_role = st.selectbox("Role Baru", ["siswa", "guru"], index=["siswa", "guru"].index(st.session_state.user["role"]), key="edit_role")
+        if st.button("Update Profil"):
+            success, message = edit_profile(st.session_state.user["username"], edit_password, edit_role)
+            if success:
+                st.session_state.user["role"] = edit_role
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
+        
+        st.markdown("---")
+        if st.button("Logout", key="logout"):
+            st.session_state.user = None
+            st.session_state.chat_history = []
+            st.session_state.memory.clear()
+            st.session_state.reset_code = None
+            st.session_state.reset_username = None
+            st.rerun()
+
+        st.markdown("---")
+        st.write("Tips:")
+        st.write("- Tanya: 'Jadwal Senin apa?'")
+        if st.session_state.user["role"] == "guru":
+            st.write("- Tambah jadwal: 'Tambah jadwal Senin: Fisika 10:00-11:30'")
+            st.write("- Update silabus: 'Tambah silabus Matematika: Bab 3 Trigonometri'")
+        st.write("- Simpan obrolan pake tombol Simpan Chat")
+
     # Load dokumen
     try:
         loader = TextLoader("data/jadwal.txt")
@@ -231,22 +364,18 @@ else:
     vectorstore = FAISS.from_documents(texts, embeddings)
     retriever = vectorstore.as_retriever()
 
-    # Inisialisasi TinyLlama
-    llm = HuggingFacePipeline.from_model_id(
-        model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        task="text-generation",
-        pipeline_kwargs={
-            "max_new_tokens": 100,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "do_sample": True
-        },
-        device=-1
-    )
+    # Load model yang dipilih
+    if 'llm' not in st.session_state or st.session_state.llm is None:
+        with st.spinner(f"Loading model {selected_model_name}..."):
+            st.session_state.llm = load_model(st.session_state.selected_model)
+
+    if not st.session_state.llm:
+        st.error("Model gagal dimuat. Coba pilih model lain atau periksa resource.")
+        st.stop()
 
     # Buat chain Q&A dengan memori
     qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
+        llm=st.session_state.llm,
         retriever=retriever,
         memory=st.session_state.memory,
         chain_type="stuff"
@@ -266,13 +395,13 @@ else:
 
     # Fungsi untuk edit profil
     def edit_profile(username, new_password, new_role):
-        if not new_password and not new_role:
+        if not new_password and new_role == st.session_state.user["role"]:
             return False, "Isi setidaknya password atau role baru!"
         users = load_users()
         if new_password:
             hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt())
             users[username]["password"] = hashed.decode("utf-8")
-        if new_role:
+        if new_role != st.session_state.user["role"]:
             users[username]["role"] = new_role
         save_users(users)
         return True, "Profil berhasil diupdate!"
@@ -280,6 +409,7 @@ else:
     # Streamlit UI Chat
     st.title("SMARING AI - Asisten Sekolah 🧠")
     st.write(f"Selamat datang, {st.session_state.user['username']} ({st.session_state.user['role']})! Tanya soal jadwal, pelajaran, atau tambah/update data sekolah! 😎")
+    st.write(f"Model aktif: {selected_model_name}")
 
     # Tampilin riwayat chat
     chat_container = st.container()
@@ -357,42 +487,3 @@ else:
             st.session_state.chat_history = []
             st.session_state.memory.clear()
             st.rerun()
-
-    # Sidebar: User info, edit profil, logout
-    with st.sidebar:
-        st.write(f"**User**: {st.session_state.user['username']}")
-        st.write(f"**Role**: {st.session_state.user['role']}")
-        if st.session_state.user["role"] == "guru":
-            st.write("Kamu bisa tambah/update jadwal atau silabus!")
-        else:
-            st.write("Tanya apa aja, simpan chatmu!")
-        
-        st.markdown("---")
-        st.subheader("Edit Profil")
-        edit_password = st.text_input("Password Baru (kosongkan jika tidak ubah)", type="password", key="edit_password")
-        edit_role = st.selectbox("Role Baru", ["siswa", "guru"], index=["siswa", "guru"].index(st.session_state.user["role"]), key="edit_role")
-        if st.button("Update Profil"):
-            success, message = edit_profile(st.session_state.user["username"], edit_password, edit_role)
-            if success:
-                st.session_state.user["role"] = edit_role
-                st.success(message)
-                st.rerun()
-            else:
-                st.error(message)
-        
-        st.markdown("---")
-        if st.button("Logout", key="logout"):
-            st.session_state.user = None
-            st.session_state.chat_history = []
-            st.session_state.memory.clear()
-            st.session_state.reset_code = None
-            st.session_state.reset_username = None
-            st.rerun()
-
-        st.markdown("---")
-        st.write("Tips:")
-        st.write("- Tanya: 'Jadwal Senin apa?'")
-        if st.session_state.user["role"] == "guru":
-            st.write("- Tambah jadwal: 'Tambah jadwal Senin: Fisika 10:00-11:30'")
-            st.write("- Update silabus: 'Tambah silabus Matematika: Bab 3 Trigonometri'")
-        st.write("- Simpan obrolan pake tombol Simpan Chat")
